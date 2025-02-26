@@ -7,7 +7,7 @@ import anyio
 import anyio.lowlevel
 import httpx
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
-from pydantic import BaseModel
+from pydantic import BaseModel, RootModel
 
 from mcp.shared.exceptions import McpError
 from mcp.types import (
@@ -26,6 +26,22 @@ from mcp.types import (
     ServerRequest,
     ServerResult,
 )
+
+RawT = TypeVar("RawT")
+
+
+class ParsedMessage(RootModel[JSONRPCMessage], Generic[RawT]):
+    root: JSONRPCMessage
+    raw: RawT | None = None
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+ReadStream = MemoryObjectReceiveStream[ParsedMessage[RawT] | Exception]
+ReadStreamWriter = MemoryObjectSendStream[ParsedMessage[RawT] | Exception]
+WriteStream = MemoryObjectSendStream[ParsedMessage[RawT]]
+WriteStreamReader = MemoryObjectReceiveStream[ParsedMessage[RawT]]
 
 SendRequestT = TypeVar("SendRequestT", ClientRequest, ServerRequest)
 SendResultT = TypeVar("SendResultT", ClientResult, ServerResult)
@@ -159,8 +175,8 @@ class BaseSession(
 
     def __init__(
         self,
-        read_stream: MemoryObjectReceiveStream[JSONRPCMessage | Exception],
-        write_stream: MemoryObjectSendStream[JSONRPCMessage],
+        read_stream: ReadStream,
+        write_stream: WriteStream,
         receive_request_type: type[ReceiveRequestT],
         receive_notification_type: type[ReceiveNotificationT],
         # If none, reading will never time out
@@ -225,7 +241,9 @@ class BaseSession(
 
         # TODO: Support progress callbacks
 
-        await self._write_stream.send(JSONRPCMessage(jsonrpc_request))
+        await self._write_stream.send(
+            ParsedMessage(JSONRPCMessage(jsonrpc_request), None)
+        )
 
         try:
             with anyio.fail_after(
@@ -261,14 +279,16 @@ class BaseSession(
             **notification.model_dump(by_alias=True, mode="json", exclude_none=True),
         )
 
-        await self._write_stream.send(JSONRPCMessage(jsonrpc_notification))
+        await self._write_stream.send(
+            ParsedMessage(JSONRPCMessage(jsonrpc_notification))
+        )
 
     async def _send_response(
         self, request_id: RequestId, response: SendResultT | ErrorData
     ) -> None:
         if isinstance(response, ErrorData):
             jsonrpc_error = JSONRPCError(jsonrpc="2.0", id=request_id, error=response)
-            await self._write_stream.send(JSONRPCMessage(jsonrpc_error))
+            await self._write_stream.send(ParsedMessage(JSONRPCMessage(jsonrpc_error)))
         else:
             jsonrpc_response = JSONRPCResponse(
                 jsonrpc="2.0",
@@ -277,7 +297,9 @@ class BaseSession(
                     by_alias=True, mode="json", exclude_none=True
                 ),
             )
-            await self._write_stream.send(JSONRPCMessage(jsonrpc_response))
+            await self._write_stream.send(
+                ParsedMessage(JSONRPCMessage(jsonrpc_response))
+            )
 
     async def _receive_loop(self) -> None:
         async with (
@@ -285,10 +307,13 @@ class BaseSession(
             self._write_stream,
             self._incoming_message_stream_writer,
         ):
-            async for message in self._read_stream:
-                if isinstance(message, Exception):
-                    await self._incoming_message_stream_writer.send(message)
-                elif isinstance(message.root, JSONRPCRequest):
+            async for raw_message in self._read_stream:
+                if isinstance(raw_message, Exception):
+                    await self._incoming_message_stream_writer.send(raw_message)
+                    continue
+
+                message = raw_message.root
+                if isinstance(message.root, JSONRPCRequest):
                     validated_request = self._receive_request_type.model_validate(
                         message.root.model_dump(
                             by_alias=True, mode="json", exclude_none=True
